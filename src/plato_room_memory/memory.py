@@ -1,143 +1,178 @@
-"""Per-room persistent memory with sliding context window, TTL, and decay."""
+"""Room memory — stores room memories with decay, importance scoring, consolidation, and search."""
 import time
-import json
-import os
+import math
+import re
 from dataclasses import dataclass, field
-from collections import deque
-from typing import Optional
+from typing import Optional, Callable
+from collections import defaultdict
+from enum import Enum
+
+class MemoryType(Enum):
+    FACT = "fact"
+    EVENT = "event"
+    PREFERENCE = "preference"
+    DECISION = "decision"
+    CONTEXT = "context"
+    EPHEMERAL = "ephemeral"
 
 @dataclass
-class MemoryEntry:
+class Memory:
+    id: str
     content: str
+    memory_type: MemoryType = MemoryType.FACT
     room: str = ""
-    timestamp: float = field(default_factory=time.time)
-    tags: list[str] = field(default_factory=list)
-    importance: float = 0.5
-    ttl: float = 0.0  # 0 = never expires
-    id: str = ""
+    source: str = ""
+    importance: float = 0.5  # 0.0-1.0
     access_count: int = 0
+    created_at: float = field(default_factory=time.time)
+    last_accessed: float = 0.0
+    tags: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+    metadata: dict = field(default_factory=dict)
+    decay_rate: float = 0.99  # per hour
+
+@dataclass
+class ConsolidatedMemory:
+    id: str
+    content: str
+    source_ids: list[str]
+    room: str = ""
+    importance: float = 0.0
+    created_at: float = field(default_factory=time.time)
 
 class RoomMemory:
-    def __init__(self, max_per_room: int = 100, context_window: int = 10,
-                 decay_rate: float = 0.999, persist_path: str = ""):
-        self._rooms: dict[str, deque] = {}
-        self.max_per_room = max_per_room
-        self.context_window = context_window
-        self.decay_rate = decay_rate
-        self.persist_path = persist_path
-        self._total_stored = 0
+    def __init__(self, decay_enabled: bool = True, consolidation_threshold: int = 100):
+        self.decay_enabled = decay_enabled
+        self.consolidation_threshold = consolidation_threshold
+        self._memories: dict[str, dict[str, Memory]] = defaultdict(dict)  # room → {id → memory}
+        self._consolidated: dict[str, list[ConsolidatedMemory]] = defaultdict(list)
+        self._decay_log: list[dict] = []
 
-    def store(self, room: str, content: str, tags: list[str] = None,
-              importance: float = 0.5, ttl: float = 0.0) -> MemoryEntry:
-        if room not in self._rooms:
-            self._rooms[room] = deque(maxlen=self.max_per_room)
-        entry = MemoryEntry(content=content, room=room, tags=tags or [],
-                          importance=importance, ttl=ttl,
-                          id=f"{room}-{self._total_stored}")
-        self._rooms[room].append(entry)
-        self._total_stored += 1
-        return entry
+    def remember(self, room: str, content: str, memory_type: str = "fact",
+                source: str = "", importance: float = 0.5, tags: list[str] = None,
+                confidence: float = 1.0) -> Memory:
+        mem_id = hashlib.md5(f"{room}:{content}:{time.time()}".encode()).hexdigest()[:12]
+        mem = Memory(id=mem_id, content=content, memory_type=MemoryType(memory_type),
+                   room=room, source=source, importance=importance, tags=tags or [],
+                   confidence=confidence)
+        self._memories[room][mem_id] = mem
+        return mem
 
-    def store_batch(self, room: str, entries: list[dict]) -> list[MemoryEntry]:
-        return [self.store(room, e.get("content", ""), e.get("tags"),
-                          e.get("importance", 0.5), e.get("ttl", 0.0)) for e in entries]
+    def recall(self, room: str, memory_id: str) -> Optional[Memory]:
+        mem = self._memories[room].get(memory_id)
+        if mem:
+            mem.access_count += 1
+            mem.last_accessed = time.time()
+            # Access boosts importance slightly
+            mem.importance = min(1.0, mem.importance + 0.01)
+        return mem
 
-    def recall(self, room: str, n: int = 0) -> list[MemoryEntry]:
-        entries = list(self._rooms.get(room, []))
-        now = time.time()
-        # Filter expired
-        entries = [e for e in entries if e.ttl == 0 or now - e.timestamp < e.ttl]
-        # Apply importance decay
-        for e in entries:
-            e.importance *= self.decay_rate
-        if n > 0:
-            return entries[-n:]
-        return entries[-self.context_window:]
+    def forget(self, room: str, memory_id: str) -> bool:
+        mem = self._memories[room].pop(memory_id, None)
+        return mem is not None
 
-    def recall_important(self, room: str, n: int = 5) -> list[MemoryEntry]:
-        entries = list(self._rooms.get(room, []))
-        now = time.time()
-        entries = [e for e in entries if e.ttl == 0 or now - e.timestamp < e.ttl]
-        entries.sort(key=lambda e: e.importance, reverse=True)
-        return entries[:n]
+    def search(self, room: str, query: str, limit: int = 20) -> list[Memory]:
+        query_lower = query.lower()
+        query_words = set(re.findall(r'\b\w+\b', query_lower))
+        scored = []
+        for mem in self._memories[room].values():
+            content_lower = mem.content.lower()
+            # Simple relevance scoring
+            score = 0.0
+            if query_lower in content_lower:
+                score += 1.0
+            for word in query_words:
+                if word in content_lower:
+                    score += 0.2
+            if any(t.lower() in query_lower for t in mem.tags):
+                score += 0.5
+            score *= mem.importance  # boost by importance
+            if score > 0:
+                scored.append((mem, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [mem for mem, _ in scored[:limit]]
 
-    def search(self, query: str, room: str = "", limit: int = 20) -> list[MemoryEntry]:
-        q = query.lower()
-        results = []
-        rooms = {room} if room else set(self._rooms.keys())
-        now = time.time()
+    def by_type(self, room: str, memory_type: str) -> list[Memory]:
+        mt = MemoryType(memory_type)
+        return [m for m in self._memories[room].values() if m.memory_type == mt]
+
+    def by_importance(self, room: str, min_importance: float = 0.5) -> list[Memory]:
+        return [m for m in self._memories[room].values() if m.importance >= min_importance]
+
+    def top_memories(self, room: str, n: int = 10) -> list[Memory]:
+        mems = list(self._memories[room].values())
+        mems.sort(key=lambda m: m.importance * (1 + m.access_count * 0.1), reverse=True)
+        return mems[:n]
+
+    def decay(self, room: str = "") -> int:
+        """Apply importance decay. Returns number of memories decayed."""
+        if not self.decay_enabled:
+            return 0
+        decayed = 0
+        rooms = [room] if room else list(self._memories.keys())
         for r in rooms:
-            for entry in self._rooms.get(r, []):
-                if entry.ttl > 0 and now - entry.timestamp >= entry.ttl:
-                    continue
-                if q in entry.content.lower() or q in " ".join(entry.tags).lower():
-                    entry.access_count += 1
-                    results.append(entry)
-        results.sort(key=lambda e: e.importance, reverse=True)
-        return results[:limit]
+            for mem in self._memories[r].values():
+                hours_since_access = (time.time() - mem.last_accessed) / 3600 if mem.last_accessed > 0 else (time.time() - mem.created_at) / 3600
+                decay_factor = mem.decay_rate ** hours_since_access
+                new_importance = mem.importance * decay_factor
+                if abs(new_importance - mem.importance) > 0.001:
+                    self._decay_log.append({"memory_id": mem.id, "room": r,
+                                          "before": mem.importance, "after": new_importance,
+                                          "hours": round(hours_since_access, 1)})
+                    mem.importance = new_importance
+                    decayed += 1
+        return decayed
 
-    def forget_room(self, room: str) -> int:
-        entries = self._rooms.pop(room, None)
-        return len(entries) if entries else 0
-
-    def forget_entry(self, room: str, entry_id: str) -> bool:
-        entries = self._rooms.get(room)
-        if not entries:
-            return False
-        for i, e in enumerate(entries):
-            if e.id == entry_id:
-                entries.remove(e)
-                return True
-        return False
-
-    def purge_expired(self) -> int:
-        now = time.time()
+    def purge_forgotten(self, threshold: float = 0.01) -> int:
+        """Remove memories below importance threshold."""
         purged = 0
-        for room_id in list(self._rooms.keys()):
-            entries = self._rooms[room_id]
-            before = len(entries)
-            self._rooms[room_id] = deque(
-                [e for e in entries if e.ttl == 0 or now - e.timestamp < e.ttl],
-                maxlen=self.max_per_room)
-            purged += before - len(self._rooms[room_id])
+        for room in self._memories:
+            to_remove = [mid for mid, m in self._memories[room].items()
+                        if m.importance < threshold]
+            for mid in to_remove:
+                self._memories[room].pop(mid, None)
+                purged += 1
         return purged
 
-    def room_names(self) -> list[str]:
-        return list(self._rooms.keys())
+    def consolidate(self, room: str) -> list[ConsolidatedMemory]:
+        """Consolidate low-importance memories into summaries."""
+        mems = list(self._memories[room].values())
+        if len(mems) < self.consolidation_threshold:
+            return []
+        # Group by type and consolidate
+        by_type = defaultdict(list)
+        for m in mems:
+            if m.importance < 0.3:
+                by_type[m.memory_type.value].append(m)
+        results = []
+        for mt, group in by_type.items():
+            if len(group) < 5:
+                continue
+            contents = [m.content for m in group]
+            # Simple consolidation: join top contents
+            consolidated_content = "; ".join(contents[:10])
+            avg_importance = sum(m.importance for m in group) / len(group)
+            source_ids = [m.id for m in group]
+            cm = ConsolidatedMemory(
+                id=f"consolidated-{mt}-{int(time.time())}",
+                content=consolidated_content, source_ids=source_ids,
+                room=room, importance=avg_importance)
+            self._consolidated[room].append(cm)
+            # Remove consolidated memories
+            for m in group:
+                self._memories[room].pop(m.id, None)
+            results.append(cm)
+        return results
 
-    def save(self, path: str = ""):
-        path = path or self.persist_path
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        data = {}
-        for room, entries in self._rooms.items():
-            data[room] = [{"content": e.content, "tags": e.tags, "importance": e.importance,
-                          "ttl": e.ttl, "timestamp": e.timestamp, "id": e.id}
-                         for e in entries]
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+    def stats(self, room: str = "") -> dict:
+        rooms = [room] if room else list(self._memories.keys())
+        total = sum(len(self._memories[r]) for r in rooms)
+        types = defaultdict(int)
+        for r in rooms:
+            for m in self._memories[r].values():
+                types[m.memory_type.value] += 1
+        return {"rooms": len(rooms), "memories": total, "types": dict(types),
+                "consolidated": sum(len(c) for c in self._consolidated.values()),
+                "decay_entries": len(self._decay_log)}
 
-    def load(self, path: str = ""):
-        path = path or self.persist_path
-        if not path or not os.path.exists(path):
-            return
-        with open(path) as f:
-            data = json.load(f)
-        for room, entries in data.items():
-            for e in entries:
-                entry = MemoryEntry(content=e["content"], room=room,
-                                  tags=e.get("tags", []), importance=e.get("importance", 0.5),
-                                  ttl=e.get("ttl", 0.0), timestamp=e.get("timestamp", time.time()),
-                                  id=e.get("id", ""))
-                if room not in self._rooms:
-                    self._rooms[room] = deque(maxlen=self.max_per_room)
-                self._rooms[room].append(entry)
-
-    @property
-    def stats(self) -> dict:
-        return {"rooms": len(self._rooms),
-                "total_entries": sum(len(v) for v in self._rooms.values()),
-                "total_stored": self._total_stored,
-                "context_window": self.context_window,
-                "decay_rate": self.decay_rate}
+import hashlib
